@@ -31,8 +31,37 @@ class MondayConfig:
         self.api_token = args.get("api_token", "")
         self.workspace_name = args.get("workspace_name", "")
         self.board_name = args.get("board_name", "")
-        self.groups = args.get("groups", [])
-        self.group_folder_map = args.get("group_folder_map", {})
+        
+        # Parse groups - ensure it's a list, not a string
+        groups_input = args.get("groups", [])
+        if isinstance(groups_input, str):
+            # Try to parse as JSON if it's a string
+            try:
+                import json as json_parser
+                self.groups = json_parser.loads(groups_input)
+            except (json.JSONDecodeError, ValueError):
+                # If it looks like a comma-separated list, split it
+                if ',' in groups_input:
+                    self.groups = [g.strip().strip('"\'') for g in groups_input.split(',')]
+                else:
+                    self.groups = [groups_input] if groups_input else []
+        elif isinstance(groups_input, list):
+            self.groups = groups_input
+        else:
+            self.groups = []
+        
+        # Parse group_folder_map - ensure it's a dict, not a string
+        folder_map_input = args.get("group_folder_map", {})
+        if isinstance(folder_map_input, str):
+            try:
+                import json as json_parser
+                self.group_folder_map = json_parser.loads(folder_map_input)
+            except (json.JSONDecodeError, ValueError):
+                self.group_folder_map = {}
+        elif isinstance(folder_map_input, dict):
+            self.group_folder_map = folder_map_input
+        else:
+            self.group_folder_map = {}
         
         # Column titles
         self.status_column_title = args.get("status_column_title", "Status")
@@ -1119,63 +1148,66 @@ class MondayAttachmentJob:
         print("   - Status = Empty: Process only today's and yesterday's date")
         print()
         
-        try:
-            board_id = await self._resolve_board_id()
-            print(f"Found board ID: {board_id}")
-            print()
-            
-            await self.item_service.initialize_group_cache(board_id)
-            print()
-            
-            await self._list_all_groups(board_id)
-            print()
-        except Exception as e:
-            print(f"ERROR: Fatal error during initialization: {e}")
-            return {"error": str(e), "capability": "download_attachments"}
-        
-        status_col_id = await self.item_service.get_status_column_id(board_id)
-        
-        # Process all groups in parallel
-        group_tasks = []
-        for group in self.config.groups:
-            task = self._process_group(board_id, group, status_col_id)
-            group_tasks.append(task)
-        
-        results = await asyncio.gather(*group_tasks, return_exceptions=True)
-        
         total_success = 0
         total_failed = 0
         total_no_pdf = 0
         groups_processed = 0
         
-        for result in results:
-            if isinstance(result, Exception):
-                total_failed += 1
-            elif result.get("processed"):
-                groups_processed += 1
-                total_success += result.get("success", 0)
-                total_failed += result.get("failed", 0)
-                total_no_pdf += result.get("no_pdf", 0)
+        try:
+            try:
+                board_id = await self._resolve_board_id()
+                print(f"Found board ID: {board_id}")
+                print()
+                
+                await self.item_service.initialize_group_cache(board_id)
+                print()
+                
+                await self._list_all_groups(board_id)
+                print()
+            except Exception as e:
+                print(f"ERROR: Fatal error during initialization: {e}")
+                return {"error": str(e), "capability": "download_attachments"}
+            
+            status_col_id = await self.item_service.get_status_column_id(board_id)
+            
+            # Process all groups in parallel
+            group_tasks = []
+            for group in self.config.groups:
+                task = self._process_group(board_id, group, status_col_id)
+                group_tasks.append(task)
+            
+            results = await asyncio.gather(*group_tasks, return_exceptions=True)
+            
+            for result in results:
+                if isinstance(result, Exception):
+                    total_failed += 1
+                elif result.get("processed"):
+                    groups_processed += 1
+                    total_success += result.get("success", 0)
+                    total_failed += result.get("failed", 0)
+                    total_no_pdf += result.get("no_pdf", 0)
+            
+            print("==========================================")
+            print("Attachment download job completed")
+            print(f"   Groups processed: {groups_processed} / {len(self.config.groups)}")
+            print(f"   Success: {total_success}")
+            print(f"   Failed: {total_failed}")
+            print(f"   No PDF found: {total_no_pdf}")
+            
+            return {
+                "result": {
+                    "groups_processed": groups_processed,
+                    "total_groups": len(self.config.groups),
+                    "success": total_success,
+                    "failed": total_failed,
+                    "no_pdf": total_no_pdf
+                },
+                "capability": "download_attachments"
+            }
         
-        await self.http.close()
-        
-        print("==========================================")
-        print("Attachment download job completed")
-        print(f"   Groups processed: {groups_processed} / {len(self.config.groups)}")
-        print(f"   Success: {total_success}")
-        print(f"   Failed: {total_failed}")
-        print(f"   No PDF found: {total_no_pdf}")
-        
-        return {
-            "result": {
-                "groups_processed": groups_processed,
-                "total_groups": len(self.config.groups),
-                "success": total_success,
-                "failed": total_failed,
-                "no_pdf": total_no_pdf
-            },
-            "capability": "download_attachments"
-        }
+        finally:
+            # Always close the HTTP session to prevent resource leaks
+            await self.http.close()
     
     async def _process_group(self, board_id: int, group_title: str, status_col_id: str) -> dict:
         """Process a single group with true streaming: fetch and download in parallel"""
@@ -1530,9 +1562,24 @@ async def update_item_status(args: dict) -> dict:
 
 async def download_attachments(args: dict) -> dict:
     """Downloads all attachments from specified Monday.com board groups"""
-    config = MondayConfig(args)
-    job = MondayAttachmentJob(config)
-    return await job.run()
+    try:
+        config = MondayConfig(args)
+        
+        # Validate required parameters
+        if not config.api_token:
+            return {"error": "Missing required parameter: api_token", "capability": "download_attachments"}
+        if not config.board_name:
+            return {"error": "Missing required parameter: board_name", "capability": "download_attachments"}
+        if not config.groups:
+            return {"error": "Missing or empty required parameter: groups", "capability": "download_attachments"}
+        if not config.group_folder_map:
+            return {"error": "Missing or empty required parameter: group_folder_map", "capability": "download_attachments"}
+        
+        job = MondayAttachmentJob(config)
+        return await job.run()
+    
+    except Exception as e:
+        return {"error": f"Unexpected error: {str(e)}", "capability": "download_attachments"}
 
 
 # ============================================================================
