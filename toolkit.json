@@ -51,11 +51,11 @@
           },
           "new_status": {
             "type": "string",
-            "description": "Status to set after successful download (default: In Queue)"
+            "description": "Status to set after successful download. MUST match an existing status label on your board exactly (default: In Queue)"
           },
           "error_status": {
             "type": "string",
-            "description": "Status to set when no PDF found (default: PO not FOUND  (ERROR))"
+            "description": "Status to set when no PDF found. MUST match an existing status label on your board exactly (default: PO not FOUND  (ERROR))"
           },
           "debug_mode": {
             "type": "boolean",
