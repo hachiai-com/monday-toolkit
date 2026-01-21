@@ -125,14 +125,49 @@ class MondayHttpClient:
         if self._download_session and not self._download_session.closed:
             await self._download_session.close()
     
-    async def post(self, payload: dict) -> dict:
-        """Make a POST request to Monday.com GraphQL API"""
+    async def post(self, payload: dict, max_retries: int = 3) -> dict:
+        """Make a POST request to Monday.com GraphQL API with retry logic for rate limits"""
         session = await self.get_session()
-        async with session.post(self.config.api_url, json=payload) as response:
-            if not response.ok:
-                error_body = await response.text()
-                raise Exception(f"HTTP error {response.status}: {error_body}")
-            return await response.json()
+        
+        for attempt in range(max_retries + 1):
+            try:
+                async with session.post(self.config.api_url, json=payload) as response:
+                    if response.status == 429:
+                        # Rate limited - extract retry_in_seconds from response
+                        error_body = await response.text()
+                        retry_seconds = 35  # Default wait time
+                        
+                        # Try to parse the retry time from response
+                        try:
+                            import re
+                            match = re.search(r'"retry_in_seconds":\s*(\d+)', error_body)
+                            if match:
+                                retry_seconds = int(match.group(1))
+                        except:
+                            pass
+                        
+                        if attempt < max_retries:
+                            print(f"Rate limited (429). Waiting {retry_seconds} seconds before retry {attempt + 1}/{max_retries}...")
+                            await asyncio.sleep(retry_seconds)
+                            continue
+                        else:
+                            raise Exception(f"HTTP error 429 after {max_retries} retries: {error_body}")
+                    
+                    if not response.ok:
+                        error_body = await response.text()
+                        raise Exception(f"HTTP error {response.status}: {error_body}")
+                    
+                    return await response.json()
+                    
+            except aiohttp.ClientError as e:
+                if attempt < max_retries:
+                    wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4 seconds
+                    print(f"Network error: {e}. Retrying in {wait_time} seconds ({attempt + 1}/{max_retries})...")
+                    await asyncio.sleep(wait_time)
+                    continue
+                raise Exception(f"Network error after {max_retries} retries: {e}")
+        
+        raise Exception("Unexpected error in post method")
     
     async def download_file(self, url: str, use_auth: bool = False) -> bytes:
         """
