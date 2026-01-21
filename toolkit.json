@@ -1,0 +1,141 @@
+{
+  "slug": "monday-attachment-downloader",
+  "display_name": "Monday.com Attachment Downloader",
+  "description": "Downloads attachments from Monday.com boards with parallel processing, group filtering, and status-based item selection. Supports automatic status updates after download.",
+  "version": "1.0.0",
+  "entrypoint": {
+    "type": "python",
+    "command": "python main.py"
+  },
+  "capabilities": [
+    {
+      "name": "download_attachments",
+      "description": "Downloads all attachments from specified Monday.com board groups with parallel processing. Filters items by status (Retry or empty with today/yesterday date). Updates item status after download.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "api_token": {
+            "type": "string",
+            "description": "Monday.com API token for authentication"
+          },
+          "workspace_name": {
+            "type": "string",
+            "description": "Name of the Monday.com workspace"
+          },
+          "board_name": {
+            "type": "string",
+            "description": "Name of the Monday.com board to process"
+          },
+          "groups": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "List of group names to process"
+          },
+          "group_folder_map": {
+            "type": "object",
+            "description": "Mapping of group names to download folder paths"
+          },
+          "status_column_title": {
+            "type": "string",
+            "description": "Title of the status column (default: Status)"
+          },
+          "date_column_title": {
+            "type": "string",
+            "description": "Title of the date column for filtering (default: Date)"
+          },
+          "target_status": {
+            "type": "string",
+            "description": "Status value to filter items by (default: Retry)"
+          },
+          "new_status": {
+            "type": "string",
+            "description": "Status to set after successful download (default: In Queue)"
+          },
+          "error_status": {
+            "type": "string",
+            "description": "Status to set when no PDF found (default: PO not FOUND  (ERROR))"
+          },
+          "debug_mode": {
+            "type": "boolean",
+            "description": "Enable debug logging (default: false)"
+          }
+        },
+        "required": ["api_token", "workspace_name", "board_name", "groups", "group_folder_map"]
+      }
+    },
+    {
+      "name": "list_groups",
+      "description": "Lists all groups in a Monday.com board",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "api_token": {
+            "type": "string",
+            "description": "Monday.com API token for authentication"
+          },
+          "workspace_name": {
+            "type": "string",
+            "description": "Name of the Monday.com workspace"
+          },
+          "board_name": {
+            "type": "string",
+            "description": "Name of the Monday.com board"
+          }
+        },
+        "required": ["api_token", "workspace_name", "board_name"]
+      }
+    },
+    {
+      "name": "get_item_status",
+      "description": "Gets the current status of a specific item",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "api_token": {
+            "type": "string",
+            "description": "Monday.com API token for authentication"
+          },
+          "board_name": {
+            "type": "string",
+            "description": "Name of the Monday.com board"
+          },
+          "item_id": {
+            "type": "integer",
+            "description": "ID of the item to check"
+          }
+        },
+        "required": ["api_token", "board_name", "item_id"]
+      }
+    },
+    {
+      "name": "update_item_status",
+      "description": "Updates the status of a specific item",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "api_token": {
+            "type": "string",
+            "description": "Monday.com API token for authentication"
+          },
+          "board_name": {
+            "type": "string",
+            "description": "Name of the Monday.com board"
+          },
+          "item_id": {
+            "type": "integer",
+            "description": "ID of the item to update"
+          },
+          "new_status": {
+            "type": "string",
+            "description": "New status value to set"
+          }
+        },
+        "required": ["api_token", "board_name", "item_id", "new_status"]
+      }
+    }
+  ],
+  "author": "RPA Team",
+  "tags": ["monday.com", "attachments", "download", "automation", "rpa"]
+}
