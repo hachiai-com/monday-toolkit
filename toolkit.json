@@ -1,16 +1,87 @@
 {
   "slug": "monday-attachment-downloader",
   "display_name": "Monday.com Attachment Downloader",
-  "description": "Downloads attachments from Monday.com boards with parallel processing, group filtering, and status-based item selection. Supports automatic status updates after download.",
-  "version": "1.0.0",
+  "description": "Downloads attachments from Monday.com boards with parallel processing, group filtering, and status-based item selection. Supports automatic status updates after download. Includes async job support for long-running operations.",
+  "version": "1.1.0",
   "entrypoint": {
     "type": "python",
     "command": "python main.py"
   },
   "capabilities": [
     {
+      "name": "start_download_job",
+      "description": "RECOMMENDED: Starts a download job in the background and returns immediately with a job_id. Use check_job_status to poll for completion. This is the preferred method for long-running downloads as it won't timeout.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "api_token": {
+            "type": "string",
+            "description": "Monday.com API token for authentication"
+          },
+          "workspace_name": {
+            "type": "string",
+            "description": "Name of the Monday.com workspace"
+          },
+          "board_name": {
+            "type": "string",
+            "description": "Name of the Monday.com board to process"
+          },
+          "groups": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "List of group names to process"
+          },
+          "group_folder_map": {
+            "type": "object",
+            "description": "Mapping of group names to download folder paths"
+          },
+          "status_column_title": {
+            "type": "string",
+            "description": "Title of the status column (default: Status)"
+          },
+          "date_column_title": {
+            "type": "string",
+            "description": "Title of the date column for filtering (default: Date)"
+          },
+          "target_status": {
+            "type": "string",
+            "description": "Status value to filter items by (default: Retry)"
+          },
+          "new_status": {
+            "type": "string",
+            "description": "Status to set after successful download. MUST match an existing status label on your board exactly (default: In Queue)"
+          },
+          "error_status": {
+            "type": "string",
+            "description": "Status to set when no PDF found. MUST match an existing status label on your board exactly (default: PO not FOUND  (ERROR))"
+          },
+          "debug_mode": {
+            "type": "boolean",
+            "description": "Enable debug logging (default: false)"
+          }
+        },
+        "required": ["api_token", "workspace_name", "board_name", "groups", "group_folder_map"]
+      }
+    },
+    {
+      "name": "check_job_status",
+      "description": "Check the status of a background download job. Returns progress information and final result when completed. Poll this endpoint after calling start_download_job.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "description": "The job ID returned by start_download_job"
+          }
+        },
+        "required": ["job_id"]
+      }
+    },
+    {
       "name": "download_attachments",
-      "description": "Downloads all attachments from specified Monday.com board groups with parallel processing. Filters items by status (Retry or empty with today/yesterday date). Updates item status after download.",
+      "description": "SYNCHRONOUS: Downloads all attachments and waits for completion. WARNING: May timeout for large jobs. Use start_download_job + check_job_status for long-running operations.",
       "schema": {
         "type": "object",
         "properties": {
