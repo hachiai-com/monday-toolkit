@@ -17,6 +17,105 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple, Callable, Any
+import subprocess
+import uuid
+import threading
+import time
+
+
+# ============================================================================
+# Job Management System
+# ============================================================================
+
+class JobManager:
+    """Manages background job state using file-based storage"""
+    
+    # Job status constants
+    STATUS_PENDING = "pending"
+    STATUS_RUNNING = "running"
+    STATUS_COMPLETED = "completed"
+    STATUS_FAILED = "failed"
+    
+    def __init__(self, jobs_dir: str = None):
+        if jobs_dir is None:
+            # Store jobs in a .monday_jobs folder in user's home or temp
+            self.jobs_dir = Path(os.environ.get("TEMP", os.environ.get("TMP", "/tmp"))) / ".monday_toolkit_jobs"
+        else:
+            self.jobs_dir = Path(jobs_dir)
+        self.jobs_dir.mkdir(parents=True, exist_ok=True)
+    
+    def _get_job_file(self, job_id: str) -> Path:
+        return self.jobs_dir / f"{job_id}.json"
+    
+    def create_job(self, job_id: str, args: dict) -> dict:
+        """Create a new job entry"""
+        job_data = {
+            "job_id": job_id,
+            "status": self.STATUS_PENDING,
+            "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
+            "args": args,
+            "progress": {
+                "groups_total": len(args.get("groups", [])),
+                "groups_processed": 0,
+                "items_processed": 0,
+                "items_success": 0,
+                "items_failed": 0,
+                "items_no_pdf": 0
+            },
+            "result": None,
+            "error": None
+        }
+        self._save_job(job_id, job_data)
+        return job_data
+    
+    def update_job_status(self, job_id: str, status: str, progress: dict = None, result: dict = None, error: str = None):
+        """Update job status and progress"""
+        job_data = self.get_job(job_id)
+        if job_data:
+            job_data["status"] = status
+            job_data["updated_at"] = datetime.now().isoformat()
+            if progress:
+                job_data["progress"].update(progress)
+            if result:
+                job_data["result"] = result
+            if error:
+                job_data["error"] = error
+            self._save_job(job_id, job_data)
+    
+    def get_job(self, job_id: str) -> Optional[dict]:
+        """Get job data by ID"""
+        job_file = self._get_job_file(job_id)
+        if job_file.exists():
+            try:
+                with open(job_file, 'r') as f:
+                    return json.load(f)
+            except:
+                return None
+        return None
+    
+    def _save_job(self, job_id: str, job_data: dict):
+        """Save job data to file"""
+        job_file = self._get_job_file(job_id)
+        with open(job_file, 'w') as f:
+            json.dump(job_data, f, indent=2)
+    
+    def cleanup_old_jobs(self, max_age_hours: int = 24):
+        """Remove job files older than max_age_hours"""
+        cutoff = datetime.now() - timedelta(hours=max_age_hours)
+        for job_file in self.jobs_dir.glob("*.json"):
+            try:
+                with open(job_file, 'r') as f:
+                    job_data = json.load(f)
+                created = datetime.fromisoformat(job_data.get("created_at", ""))
+                if created < cutoff:
+                    job_file.unlink()
+            except:
+                pass
+
+
+# Global job manager instance
+_job_manager = JobManager()
 
 
 # ============================================================================
@@ -1403,6 +1502,71 @@ class MondayAttachmentJob:
 
 
 # ============================================================================
+# MondayAttachmentJob with Progress Reporting (for background jobs)
+# ============================================================================
+
+class MondayAttachmentJobWithProgress(MondayAttachmentJob):
+    """
+    Extended version of MondayAttachmentJob that reports progress to JobManager.
+    Used for background/async job processing.
+    """
+    
+    def __init__(self, config: MondayConfig, job_id: str, job_manager: JobManager):
+        super().__init__(config)
+        self.job_id = job_id
+        self.job_manager = job_manager
+        self._items_processed = 0
+        self._items_success = 0
+        self._items_failed = 0
+        self._items_no_pdf = 0
+        self._groups_processed = 0
+    
+    def _update_progress(self):
+        """Update job progress in storage"""
+        self.job_manager.update_job_status(
+            self.job_id,
+            JobManager.STATUS_RUNNING,
+            progress={
+                "groups_total": len(self.config.groups),
+                "groups_processed": self._groups_processed,
+                "items_processed": self._items_processed,
+                "items_success": self._items_success,
+                "items_failed": self._items_failed,
+                "items_no_pdf": self._items_no_pdf
+            }
+        )
+    
+    async def _process_item(self, board_id: int, item_id: int, download_folder: str, group_name: str) -> str:
+        """Process a single item with progress reporting"""
+        result = await super()._process_item(board_id, item_id, download_folder, group_name)
+        
+        # Update counters
+        self._items_processed += 1
+        if result == "success":
+            self._items_success += 1
+        elif result == "no_pdf":
+            self._items_no_pdf += 1
+        else:
+            self._items_failed += 1
+        
+        # Update progress every item
+        self._update_progress()
+        
+        return result
+    
+    async def _process_group(self, board_id: int, group_title: str, status_col_id: str) -> dict:
+        """Process group with progress reporting"""
+        result = await super()._process_group(board_id, group_title, status_col_id)
+        
+        # Update group count
+        if result.get("processed"):
+            self._groups_processed += 1
+            self._update_progress()
+        
+        return result
+
+
+# ============================================================================
 # Capability: List Groups
 # ============================================================================
 
@@ -1618,6 +1782,181 @@ async def download_attachments(args: dict) -> dict:
 
 
 # ============================================================================
+# Capability: Start Download Job (Async - returns immediately)
+# ============================================================================
+
+def start_download_job(args: dict) -> dict:
+    """
+    Starts a download job in the background and returns immediately with a job_id.
+    Use check_job_status to poll for completion.
+    """
+    try:
+        # Validate required parameters
+        if not args.get("api_token"):
+            return {"error": "Missing required parameter: api_token", "capability": "start_download_job"}
+        if not args.get("board_name"):
+            return {"error": "Missing required parameter: board_name", "capability": "start_download_job"}
+        if not args.get("groups"):
+            return {"error": "Missing or empty required parameter: groups", "capability": "start_download_job"}
+        if not args.get("group_folder_map"):
+            return {"error": "Missing or empty required parameter: group_folder_map", "capability": "start_download_job"}
+        
+        # Generate unique job ID
+        job_id = str(uuid.uuid4())[:8]
+        
+        # Create job entry
+        _job_manager.create_job(job_id, args)
+        
+        # Start background process to run the actual download
+        # We'll use subprocess to run a separate Python process
+        script_path = os.path.abspath(__file__)
+        
+        # Prepare the input for the background process
+        background_input = json.dumps({
+            "capability": "_run_background_job",
+            "args": {
+                "job_id": job_id,
+                "original_args": args
+            }
+        })
+        
+        # Start the background process (detached)
+        if sys.platform == 'win32':
+            # Windows: Use CREATE_NEW_PROCESS_GROUP and DETACHED_PROCESS
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            CREATE_NO_WINDOW = 0x08000000
+            
+            process = subprocess.Popen(
+                [sys.executable, script_path],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+                close_fds=True
+            )
+            # Write input and close stdin to let the process run
+            process.stdin.write(background_input.encode())
+            process.stdin.close()
+        else:
+            # Unix: Use nohup-like behavior
+            process = subprocess.Popen(
+                [sys.executable, script_path],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True
+            )
+            process.stdin.write(background_input.encode())
+            process.stdin.close()
+        
+        return {
+            "result": {
+                "job_id": job_id,
+                "status": "started",
+                "message": "Download job started in background. Use check_job_status to monitor progress."
+            },
+            "capability": "start_download_job"
+        }
+        
+    except Exception as e:
+        return {"error": f"Failed to start job: {str(e)}", "capability": "start_download_job"}
+
+
+# ============================================================================
+# Capability: Check Job Status
+# ============================================================================
+
+def check_job_status(args: dict) -> dict:
+    """
+    Check the status of a background download job.
+    Returns current progress and final result when completed.
+    """
+    try:
+        job_id = args.get("job_id")
+        if not job_id:
+            return {"error": "Missing required parameter: job_id", "capability": "check_job_status"}
+        
+        job_data = _job_manager.get_job(job_id)
+        
+        if job_data is None:
+            return {
+                "error": f"Job not found: {job_id}",
+                "capability": "check_job_status"
+            }
+        
+        response = {
+            "result": {
+                "job_id": job_id,
+                "status": job_data["status"],
+                "created_at": job_data["created_at"],
+                "updated_at": job_data["updated_at"],
+                "progress": job_data["progress"]
+            },
+            "capability": "check_job_status"
+        }
+        
+        # Include result if completed
+        if job_data["status"] == JobManager.STATUS_COMPLETED and job_data.get("result"):
+            response["result"]["final_result"] = job_data["result"]
+        
+        # Include error if failed
+        if job_data["status"] == JobManager.STATUS_FAILED and job_data.get("error"):
+            response["result"]["error"] = job_data["error"]
+        
+        return response
+        
+    except Exception as e:
+        return {"error": f"Error checking job status: {str(e)}", "capability": "check_job_status"}
+
+
+# ============================================================================
+# Internal: Run Background Job
+# ============================================================================
+
+async def _run_background_job(args: dict) -> dict:
+    """
+    Internal capability - runs the actual download job in background process.
+    Updates job status as it progresses.
+    """
+    job_id = args.get("job_id")
+    original_args = args.get("original_args", {})
+    
+    try:
+        # Update status to running
+        _job_manager.update_job_status(job_id, JobManager.STATUS_RUNNING)
+        
+        config = MondayConfig(original_args)
+        job = MondayAttachmentJobWithProgress(config, job_id, _job_manager)
+        result = await job.run()
+        
+        # Update status to completed with result
+        if "error" in result:
+            _job_manager.update_job_status(
+                job_id, 
+                JobManager.STATUS_FAILED, 
+                error=result["error"]
+            )
+        else:
+            _job_manager.update_job_status(
+                job_id, 
+                JobManager.STATUS_COMPLETED, 
+                result=result.get("result")
+            )
+        
+        return result
+        
+    except Exception as e:
+        _job_manager.update_job_status(
+            job_id, 
+            JobManager.STATUS_FAILED, 
+            error=str(e)
+        )
+        return {"error": str(e), "capability": "_run_background_job"}
+
+
+# ============================================================================
 # Main Entry Point
 # ============================================================================
 
@@ -1629,9 +1968,25 @@ def main():
         capability = input_data.get("capability")
         args = input_data.get("args", {})
         
+        # Original synchronous capability (blocks until complete)
         if capability == "download_attachments":
             result = asyncio.run(download_attachments(args))
             print(json.dumps(result, indent=2))
+        
+        # NEW: Async job - starts background process and returns immediately
+        elif capability == "start_download_job":
+            result = start_download_job(args)
+            print(json.dumps(result, indent=2))
+        
+        # NEW: Check status of background job
+        elif capability == "check_job_status":
+            result = check_job_status(args)
+            print(json.dumps(result, indent=2))
+        
+        # Internal: Run background job (called by start_download_job subprocess)
+        elif capability == "_run_background_job":
+            # This runs in the background process - no output needed
+            asyncio.run(_run_background_job(args))
         
         elif capability == "list_groups":
             result = asyncio.run(list_groups(args))
