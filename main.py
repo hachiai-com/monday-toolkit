@@ -674,13 +674,19 @@ class MondayItemService:
                     
                     should_include = False
                     
-                    if self.config.target_status.lower() == current_status.lower():
+                    # Check if item matches target_status (e.g., "Retry")
+                    if self.config.target_status and self.config.target_status.lower() == current_status.lower():
                         should_include = True
-                    elif not current_status:
+                    
+                    # ALSO check for empty status items with today/yesterday dates (when target_status is "Retry" or empty)
+                    # This allows processing both "Retry" status items AND empty status items (today/yesterday)
+                    if not current_status:
                         if date_col_id and item_date:
+                            # Only include if date is today or yesterday
                             if item_date == today.strftime(date_format) or item_date == yesterday.strftime(date_format):
                                 should_include = True
-                        else:
+                        elif not self.config.target_status or self.config.target_status.lower() == "retry":
+                            # If no date column or date not found, include empty status items only if target_status is "Retry" or empty
                             should_include = True
                     
                     if should_include:
@@ -1144,11 +1150,14 @@ class MondayAttachmentService:
         # Get email for filename
         email = await self.item_service.get_item_email(item_id, board_id)
         
-        # Track seen asset IDs to avoid duplicates
+        # Track seen asset IDs to avoid duplicates (normalize to string for consistent comparison)
         seen_asset_ids = set()
+        seen_file_names = {}  # Track by filename + item_id to detect cross-item duplicates
         
         for asset in all_assets:
-            asset_id = asset.get("id", "")
+            # Normalize asset_id to string for consistent comparison
+            asset_id_raw = asset.get("id", "")
+            asset_id = str(asset_id_raw) if asset_id_raw else ""
             file_name = asset.get("name", "")
             public_url = asset.get("public_url", "")
             asset_url = asset.get("url", "")  # Authenticated URL (doesn't expire)
@@ -1158,10 +1167,20 @@ class MondayAttachmentService:
                 print("WARNING: Skipping asset with no ID")
                 continue
             
-            # Skip duplicate assets
+            # Skip duplicate assets within the same item (same asset ID)
             if asset_id in seen_asset_ids:
+                print(f"   SKIPPING duplicate asset ID {asset_id} (already processed for this item)")
                 continue
             seen_asset_ids.add(asset_id)
+            
+            # Also check for duplicate filenames within the same item (in case same file has different asset IDs)
+            if file_name:
+                file_key = f"{file_name}_{item_id}"
+                if file_key in seen_file_names:
+                    print(f"   WARNING: Duplicate filename '{file_name}' detected (asset IDs: {seen_file_names[file_key]} vs {asset_id})")
+                    # Still process it but log the warning
+                else:
+                    seen_file_names[file_key] = asset_id
             
             total_count += 1
             
@@ -1278,8 +1297,16 @@ class MondayAttachmentJob:
         print(f"Workspace: {self.config.workspace_name}")
         print(f"Board: {self.config.board_name}")
         print("Filter Criteria:")
-        print("   - Status = 'Retry': Process ALL items")
-        print("   - Status = Empty: Process only today's and yesterday's date")
+        if self.config.target_status and self.config.target_status.lower() == "retry":
+            print(f"   - Status = 'Retry': Process ALL items with 'Retry' status")
+            print(f"   - Status = Empty: Process items with empty status (today's and yesterday's date only)")
+        elif not self.config.target_status or self.config.target_status == "":
+            print(f"   - Status = Empty: Process only items with empty status (today's and yesterday's date only)")
+        else:
+            print(f"   - Status = '{self.config.target_status}': Process ONLY items with this exact status")
+        print(f"   - target_status parameter: '{self.config.target_status}'")
+        print(f"   - new_status parameter: '{self.config.new_status}'")
+        print(f"   - error_status parameter: '{self.config.error_status}'")
         print()
         
         total_success = 0
@@ -1303,6 +1330,20 @@ class MondayAttachmentJob:
                 return {"error": str(e), "capability": "download_attachments"}
             
             status_col_id = await self.item_service.get_status_column_id(board_id)
+            
+            if not status_col_id:
+                raise Exception("CRITICAL: Status column ID not found! Filtering will not work correctly.")
+            
+            print(f"Status column ID found: {status_col_id}")
+            print(f"Filtering will process:")
+            if self.config.target_status and self.config.target_status.lower() == "retry":
+                print(f"  1. Items with status = 'Retry'")
+                print(f"  2. Items with empty status AND date = today or yesterday")
+            elif not self.config.target_status or self.config.target_status == "":
+                print(f"  1. Items with empty status AND date = today or yesterday")
+            else:
+                print(f"  1. Items with status = '{self.config.target_status}'")
+            print()
             
             # Process all groups in parallel
             group_tasks = []
@@ -1359,6 +1400,7 @@ class MondayAttachmentJob:
         failed = 0
         no_pdf = 0
         download_tasks = []  # Store background download tasks
+        processed_item_ids = set()  # Track items already being processed to prevent duplicates
         
         try:
             # TRUE STREAMING: Start downloads immediately as items are found
@@ -1366,10 +1408,22 @@ class MondayAttachmentJob:
             def on_batch_found(batch_item_ids):
                 print(f"Starting download for {len(batch_item_ids)} item(s)...")
                 for item_id in batch_item_ids:
-                    print(f"  Processing item ID: {item_id}")
+                    # Normalize item_id to int for consistent comparison
+                    item_id_int = int(item_id) if item_id else None
+                    if not item_id_int:
+                        print(f"  WARNING: Skipping invalid item ID: {item_id}")
+                        continue
+                    
+                    # Skip if already being processed (duplicate in batch)
+                    if item_id_int in processed_item_ids:
+                        print(f"  SKIPPING duplicate item ID {item_id_int} (already queued for processing)")
+                        continue
+                    
+                    processed_item_ids.add(item_id_int)
+                    print(f"  Processing item ID: {item_id_int}")
                     # Create task immediately - runs in background while fetching continues
                     task = asyncio.create_task(
-                        self._process_item(board_id, item_id, download_folder, group_title)
+                        self._process_item(board_id, item_id_int, download_folder, group_title)
                     )
                     download_tasks.append(task)
             
@@ -1924,10 +1978,40 @@ async def _run_background_job(args: dict) -> dict:
     original_args = args.get("original_args", {})
     
     try:
+        # Log received parameters for debugging
+        print(f"Background job {job_id} started with parameters:")
+        print(f"  - target_status: {original_args.get('target_status', 'NOT PROVIDED (will use default: Retry)')}")
+        print(f"  - new_status: {original_args.get('new_status', 'NOT PROVIDED (will use default: In Queue)')}")
+        print(f"  - error_status: {original_args.get('error_status', 'NOT PROVIDED (will use default)')}")
+        print(f"  - status_column_title: {original_args.get('status_column_title', 'NOT PROVIDED (will use default: Status)')}")
+        print(f"  - date_column_title: {original_args.get('date_column_title', 'NOT PROVIDED (will use default: Date)')}")
+        print(f"  - groups: {original_args.get('groups', [])}")
+        print()
+        
+        # Validate required parameters
+        if not original_args.get("api_token"):
+            raise Exception("Missing required parameter: api_token")
+        if not original_args.get("board_name"):
+            raise Exception("Missing required parameter: board_name")
+        if not original_args.get("groups"):
+            raise Exception("Missing required parameter: groups")
+        if not original_args.get("group_folder_map"):
+            raise Exception("Missing required parameter: group_folder_map")
+        
         # Update status to running
         _job_manager.update_job_status(job_id, JobManager.STATUS_RUNNING)
         
         config = MondayConfig(original_args)
+        
+        # Log the actual config values being used
+        print(f"Using configuration:")
+        print(f"  - target_status: '{config.target_status}'")
+        print(f"  - new_status: '{config.new_status}'")
+        print(f"  - error_status: '{config.error_status}'")
+        print(f"  - status_column_title: '{config.status_column_title}'")
+        print(f"  - date_column_title: '{config.date_column_title}'")
+        print()
+        
         job = MondayAttachmentJobWithProgress(config, job_id, _job_manager)
         result = await job.run()
         
