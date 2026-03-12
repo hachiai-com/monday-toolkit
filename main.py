@@ -11,8 +11,10 @@ import sys
 import os
 import re
 import asyncio
+import ssl
 import aiohttp
 import aiofiles
+import certifi
 from datetime import datetime, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +23,11 @@ import subprocess
 import uuid
 import threading
 import time
+
+
+def _ssl_context():
+    """SSL context using certifi CA bundle for reliable cert verification on Windows."""
+    return ssl.create_default_context(cafile=certifi.where())
 
 
 # ============================================================================
@@ -196,7 +203,9 @@ class MondayHttpClient:
     
     async def get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            connector = aiohttp.TCPConnector(ssl=_ssl_context())
             self._session = aiohttp.ClientSession(
+                connector=connector,
                 headers={
                     "Authorization": self.config.api_token,
                     "Content-Type": "application/json"
@@ -210,7 +219,7 @@ class MondayHttpClient:
             # Create connector with larger header size limit (64KB instead of 8KB default)
             # NOTE: Do NOT set Authorization header here - public URLs (S3/CDN) don't need it
             # and may reject requests with unexpected auth headers
-            connector = aiohttp.TCPConnector(limit=100)
+            connector = aiohttp.TCPConnector(limit=100, ssl=_ssl_context())
             self._download_session = aiohttp.ClientSession(
                 connector=connector,
                 max_line_size=65536,  # 64KB max header line size
@@ -1377,7 +1386,8 @@ class MondayAttachmentJob:
                     "failed": total_failed,
                     "no_pdf": total_no_pdf
                 },
-                "capability": "download_attachments"
+                "capability": "download_attachments",
+                "status": "complete",
             }
         
         finally:
@@ -1673,7 +1683,8 @@ async def list_groups(args: dict) -> dict:
                 "board_name": config.board_name,
                 "groups": group_list
             },
-            "capability": "list_groups"
+            "capability": "list_groups",
+            "status": "complete",
         }
     
     finally:
@@ -1749,7 +1760,8 @@ async def get_item_status(args: dict) -> dict:
                 "item_name": item.get("name"),
                 "status": status
             },
-            "capability": "get_item_status"
+            "capability": "get_item_status",
+            "status": "complete",
         }
     
     finally:
@@ -1802,7 +1814,8 @@ async def update_item_status(args: dict) -> dict:
                 "new_status": new_status,
                 "success": True
             },
-            "capability": "update_item_status"
+            "capability": "update_item_status",
+            "status": "complete",
         }
     
     finally:
@@ -1911,7 +1924,8 @@ def start_download_job(args: dict) -> dict:
                 "status": "started",
                 "message": "Download job started in background. Use check_job_status to monitor progress."
             },
-            "capability": "start_download_job"
+            "capability": "start_download_job",
+            "status": "complete",
         }
         
     except Exception as e:
@@ -1948,7 +1962,8 @@ def check_job_status(args: dict) -> dict:
                 "updated_at": job_data["updated_at"],
                 "progress": job_data["progress"]
             },
-            "capability": "check_job_status"
+            "capability": "check_job_status",
+            "status": "complete",
         }
         
         # Include result if completed
