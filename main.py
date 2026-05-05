@@ -15,19 +15,53 @@ import ssl
 import aiohttp
 import aiofiles
 import certifi
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Optional, Tuple, Callable, Any
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import subprocess
 import uuid
 import threading
 import time
 
+from execution_file_log import run_with_execution_log
+
 
 def _ssl_context():
     """SSL context using certifi CA bundle for reliable cert verification on Windows."""
     return ssl.create_default_context(cafile=certifi.where())
+
+
+def _log_info(message: str) -> None:
+    print(f"[INFO] {message}")
+
+
+def _log_warn(message: str) -> None:
+    print(f"[WARN] {message}")
+
+
+def _log_error(message: str) -> None:
+    print(f"[ERROR] {message}")
+
+
+def _log_section(title: str) -> None:
+    print(f"\n=== {title} ===")
+
+
+def _log_monday_graphql_payload(payload: dict) -> None:
+    """Write GraphQL query (and variables) from a Monday API POST body to stdout for auditing."""
+    q = payload.get("query")
+    if not q or not isinstance(q, str):
+        return
+    _log_section("Monday GraphQL Request")
+    _log_info("query:")
+    print(q.strip())
+    vars_ = payload.get("variables")
+    if vars_:
+        try:
+            _log_info(f"variables: {json.dumps(vars_, default=str)}")
+        except Exception:
+            _log_info(f"variables: {str(vars_)}")
 
 
 # ============================================================================
@@ -236,7 +270,8 @@ class MondayHttpClient:
     async def post(self, payload: dict, max_retries: int = 3) -> dict:
         """Make a POST request to Monday.com GraphQL API with retry logic for rate limits"""
         session = await self.get_session()
-        
+        _log_monday_graphql_payload(payload)
+
         for attempt in range(max_retries + 1):
             try:
                 async with session.post(self.config.api_url, json=payload) as response:
@@ -255,7 +290,10 @@ class MondayHttpClient:
                             pass
                         
                         if attempt < max_retries:
-                            print(f"Rate limited (429). Waiting {retry_seconds} seconds before retry {attempt + 1}/{max_retries}...")
+                            _log_warn(
+                                f"Rate limited (429). Waiting {retry_seconds}s before retry "
+                                f"{attempt + 1}/{max_retries}."
+                            )
                             await asyncio.sleep(retry_seconds)
                             continue
                         else:
@@ -270,7 +308,10 @@ class MondayHttpClient:
             except aiohttp.ClientError as e:
                 if attempt < max_retries:
                     wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4 seconds
-                    print(f"Network error: {e}. Retrying in {wait_time} seconds ({attempt + 1}/{max_retries})...")
+                    _log_warn(
+                        f"Network error: {e}. Retrying in {wait_time}s "
+                        f"({attempt + 1}/{max_retries})."
+                    )
                     await asyncio.sleep(wait_time)
                     continue
                 raise Exception(f"Network error after {max_retries} retries: {e}")
@@ -455,7 +496,8 @@ class MondayItemService:
         if self.config._group_id_cache:
             return
         
-        print("Initializing group ID cache...")
+        _log_section("Group Cache")
+        _log_info("Initializing group ID cache...")
         
         payload = {
             "query": f"""query {{
@@ -468,7 +510,7 @@ class MondayItemService:
         response = await self.http.post(payload)
         
         if "errors" in response:
-            print(f"ERROR: Failed to fetch groups: {response['errors']}")
+            _log_error(f"Failed to fetch groups: {response['errors']}")
             return
         
         boards = response.get("data", {}).get("boards", [])
@@ -485,7 +527,7 @@ class MondayItemService:
             if current_title.startswith("> "):
                 self.config._group_id_cache[current_title[2:].strip()] = group_id
         
-        print(f"Cached {len(self.config._group_id_cache)} group IDs")
+        _log_info(f"Cached {len(self.config._group_id_cache)} group IDs.")
     
     def _get_group_id_by_title(self, group_title: str) -> Optional[str]:
         """Get group ID by group title (uses cache)"""
@@ -552,7 +594,47 @@ class MondayItemService:
         except Exception:
             pass
         return ""
-    
+
+    def _item_matches_download_filter(
+        self,
+        item: Dict[str, Any],
+        status_col_id: str,
+        date_col_id: Optional[str],
+        today: date,
+        yesterday: date,
+    ) -> bool:
+        """
+        Row selection for attachment download:
+        - If status matches config.target_status (e.g. Retry): include — no date restriction.
+        - If status is empty: include only when Date is today or yesterday (strict; missing date excludes).
+        """
+        columns_node = item.get("column_values") or []
+        if not columns_node:
+            return False
+
+        current_status = ""
+        item_date = ""
+        for col in columns_node:
+            col_id = col.get("id", "")
+            if status_col_id == col_id:
+                current_status = (col.get("text") or "").strip()
+            if date_col_id and date_col_id == col_id:
+                item_date = self._extract_date_from_column(col)
+
+        ts = (self.config.target_status or "").strip()
+        if ts and current_status.lower() == ts.lower():
+            return True
+
+        if not current_status:
+            if not date_col_id:
+                return False
+            if not item_date:
+                return False
+            dfmt = "%Y-%m-%d"
+            return item_date == today.strftime(dfmt) or item_date == yesterday.strftime(dfmt)
+
+        return False
+
     async def stream_item_ids_from_group(
         self,
         board_id: int,
@@ -601,8 +683,7 @@ class MondayItemService:
         
         today = datetime.now().date()
         yesterday = today - timedelta(days=1)
-        date_format = "%Y-%m-%d"
-        
+
         while items_found < limit:
             cursor_part = f', cursor: "{cursor}"' if cursor else ""
             page_limit = 100
@@ -629,6 +710,10 @@ class MondayItemService:
             response = await self.http.post(payload)
             
             if "errors" in response:
+                print(
+                    f"WARNING: items_page GraphQL error; using filtered fallback (same rules as main path): "
+                    f"{response.get('errors')}"
+                )
                 items = await self._get_item_ids_from_group_id_alternative(
                     board_id, group_id, limit, status_col_id, target_status
                 )
@@ -664,41 +749,9 @@ class MondayItemService:
                     continue
                 
                 if status_col_id:
-                    columns_node = item.get("column_values", [])
-                    if not columns_node:
-                        if not target_status:
-                            batch_items.append(int(item.get("id")))
-                            items_found += 1
-                        continue
-                    
-                    current_status = ""
-                    item_date = ""
-                    
-                    for col in columns_node:
-                        col_id = col.get("id", "")
-                        if status_col_id == col_id:
-                            current_status = col.get("text", "").strip()
-                        if date_col_id and date_col_id == col_id:
-                            item_date = self._extract_date_from_column(col)
-                    
-                    should_include = False
-                    
-                    # Check if item matches target_status (e.g., "Retry")
-                    if self.config.target_status and self.config.target_status.lower() == current_status.lower():
-                        should_include = True
-                    
-                    # ALSO check for empty status items with today/yesterday dates (when target_status is "Retry" or empty)
-                    # This allows processing both "Retry" status items AND empty status items (today/yesterday)
-                    if not current_status:
-                        if date_col_id and item_date:
-                            # Only include if date is today or yesterday
-                            if item_date == today.strftime(date_format) or item_date == yesterday.strftime(date_format):
-                                should_include = True
-                        elif not self.config.target_status or self.config.target_status.lower() == "retry":
-                            # If no date column or date not found, include empty status items only if target_status is "Retry" or empty
-                            should_include = True
-                    
-                    if should_include:
+                    if self._item_matches_download_filter(
+                        item, status_col_id, date_col_id, today, yesterday
+                    ):
                         batch_items.append(int(item.get("id")))
                         items_found += 1
                 else:
@@ -721,16 +774,25 @@ class MondayItemService:
         group_title: str,
         limit: int,
         status_col_id: Optional[str],
-        target_status: Optional[str]
+        _target_status: Optional[str],
     ) -> List[int]:
         """Get the first N item IDs from a specific group by searching through items (fallback method)"""
         result = []
         cursor = None
         items_checked = 0
-        
+
+        date_col_id: Optional[str] = None
+        if status_col_id:
+            try:
+                date_col_id = await self.get_date_column_id(board_id)
+            except Exception:
+                pass
+        today = datetime.now().date()
+        yesterday = today - timedelta(days=1)
+
         while True:
             cursor_part = f', cursor: "{cursor}"' if cursor else ""
-            column_values_part = "column_values { id text }" if status_col_id else ""
+            column_values_part = "column_values { id text value }" if status_col_id else ""
             
             query = f"""query {{
                 boards(ids: {board_id}) {{
@@ -783,24 +845,11 @@ class MondayItemService:
                     continue
                 
                 if status_col_id:
-                    columns_node = item.get("column_values", [])
-                    if not columns_node:
-                        if not target_status:
-                            if not result:
-                                print(f"   Found match for group: {group_title} (status: empty)")
-                            result.append(int(item.get("id")))
-                        continue
-                    
-                    current_status = ""
-                    for col in columns_node:
-                        col_id = col.get("id", "")
-                        if status_col_id == col_id:
-                            current_status = col.get("text", "").strip()
-                            break
-                    
-                    if not current_status or (target_status and target_status.lower() == current_status.lower()):
+                    if self._item_matches_download_filter(
+                        item, status_col_id, date_col_id, today, yesterday
+                    ):
                         if not result:
-                            print(f"   Found match for group: {group_title} (status: '{current_status}')")
+                            print(f"   Found match for group: {group_title}")
                         result.append(int(item.get("id")))
                 else:
                     if not result:
@@ -824,15 +873,29 @@ class MondayItemService:
         group_id: str,
         limit: int,
         status_col_id: Optional[str],
-        target_status: Optional[str]
+        _target_status: Optional[str],
     ) -> List[int]:
-        """Alternative method to get first N items from group with status filtering"""
-        result = []
+        """
+        Fallback when the main items_page query returns GraphQL errors.
+        Uses the same Retry / empty+today|yesterday rules as the main path — never returns an unfiltered group.
+        """
+        result: List[int] = []
+        if not status_col_id:
+            return result
+
+        date_col_id: Optional[str] = None
+        try:
+            date_col_id = await self.get_date_column_id(board_id)
+        except Exception:
+            pass
+
+        today = datetime.now().date()
+        yesterday = today - timedelta(days=1)
         cursor = None
-        
+
         while len(result) < limit:
             cursor_part = f', cursor: "{cursor}"' if cursor else ""
-            
+
             query = f"""query {{
                 boards(ids: {board_id}) {{
                     items_page(limit: 100{cursor_part}) {{
@@ -840,43 +903,48 @@ class MondayItemService:
                         items {{
                             id
                             group {{ id title }}
+                            column_values {{ id text value }}
                         }}
                     }}
                 }}
             }}"""
-            
+
             payload = {"query": query}
             response = await self.http.post(payload)
-            
+
             if "errors" in response:
+                print(f"WARNING: Filtered fallback items_page also failed: {response.get('errors')}")
                 break
-            
+
             boards = response.get("data", {}).get("boards", [])
             if not boards:
                 break
-            
+
             items_page = boards[0].get("items_page", {})
             items_node = items_page.get("items", [])
-            
+
             if items_node:
                 for item in items_node:
                     if len(result) >= limit:
                         break
-                    
+
                     group_node = item.get("group")
                     if not group_node:
                         continue
-                    
+
                     item_group_id = group_node.get("id", "")
                     if group_id != item_group_id:
                         continue
-                    
-                    result.append(int(item.get("id")))
-            
+
+                    if self._item_matches_download_filter(
+                        item, status_col_id, date_col_id, today, yesterday
+                    ):
+                        result.append(int(item.get("id")))
+
             cursor = items_page.get("cursor")
             if len(result) >= limit or not cursor:
                 break
-        
+
         return result
     
     def _matches_group(self, target_group: str, current_group: str) -> bool:
@@ -938,11 +1006,10 @@ class MondayItemService:
         response = await self.http.post(payload)
         
         if "errors" in response:
-            print(f"ERROR: Failed to update status for item {item_id}")
-            print(f"Errors: {response['errors']}")
+            _log_error(f"Failed to update status for item {item_id}: {response['errors']}")
             raise Exception(f"Status update failed: {response['errors']}")
         
-        print(f"Status updated to '{new_status}' for item {item_id}")
+        _log_info(f"Status updated to '{new_status}' for item {item_id}.")
     
     async def get_item_email(self, item_id: int, board_id: int) -> str:
         """Get item email from Email column"""
@@ -1302,21 +1369,20 @@ class MondayAttachmentJob:
     
     async def run(self) -> dict:
         """Run the attachment download job"""
-        print("Starting Monday.com attachment download job...")
-        print(f"Workspace: {self.config.workspace_name}")
-        print(f"Board: {self.config.board_name}")
-        print("Filter Criteria:")
+        _log_section("Monday Attachment Download Job")
+        _log_info(f"Workspace: {self.config.workspace_name}")
+        _log_info(f"Board: {self.config.board_name}")
+        _log_info("Filter criteria:")
         if self.config.target_status and self.config.target_status.lower() == "retry":
-            print(f"   - Status = 'Retry': Process ALL items with 'Retry' status")
-            print(f"   - Status = Empty: Process items with empty status (today's and yesterday's date only)")
+            _log_info(" - Status 'Retry': include all Retry rows (no date filter).")
+            _log_info(" - Empty status: include only rows with Date = today or yesterday.")
         elif not self.config.target_status or self.config.target_status == "":
-            print(f"   - Status = Empty: Process only items with empty status (today's and yesterday's date only)")
+            _log_info(" - Empty status: include only rows with Date = today or yesterday.")
         else:
-            print(f"   - Status = '{self.config.target_status}': Process ONLY items with this exact status")
-        print(f"   - target_status parameter: '{self.config.target_status}'")
-        print(f"   - new_status parameter: '{self.config.new_status}'")
-        print(f"   - error_status parameter: '{self.config.error_status}'")
-        print()
+            _log_info(f" - Status '{self.config.target_status}': include exact status match only.")
+        _log_info(f"target_status parameter: '{self.config.target_status}'")
+        _log_info(f"new_status parameter: '{self.config.new_status}'")
+        _log_info(f"error_status parameter: '{self.config.error_status}'")
         
         total_success = 0
         total_failed = 0
@@ -1326,16 +1392,13 @@ class MondayAttachmentJob:
         try:
             try:
                 board_id = await self._resolve_board_id()
-                print(f"Found board ID: {board_id}")
-                print()
+                _log_info(f"Resolved board ID: {board_id}")
                 
                 await self.item_service.initialize_group_cache(board_id)
-                print()
                 
                 await self._list_all_groups(board_id)
-                print()
             except Exception as e:
-                print(f"ERROR: Fatal error during initialization: {e}")
+                _log_error(f"Fatal error during initialization: {e}")
                 return {"error": str(e), "capability": "download_attachments"}
             
             status_col_id = await self.item_service.get_status_column_id(board_id)
@@ -1343,16 +1406,15 @@ class MondayAttachmentJob:
             if not status_col_id:
                 raise Exception("CRITICAL: Status column ID not found! Filtering will not work correctly.")
             
-            print(f"Status column ID found: {status_col_id}")
-            print(f"Filtering will process:")
+            _log_info(f"Status column ID: {status_col_id}")
+            _log_info("Filtering will process:")
             if self.config.target_status and self.config.target_status.lower() == "retry":
-                print(f"  1. Items with status = 'Retry'")
-                print(f"  2. Items with empty status AND date = today or yesterday")
+                _log_info(" 1) Items with status = 'Retry' (any date)")
+                _log_info(" 2) Items with empty status AND date = today or yesterday only")
             elif not self.config.target_status or self.config.target_status == "":
-                print(f"  1. Items with empty status AND date = today or yesterday")
+                _log_info(" 1) Items with empty status AND date = today or yesterday only")
             else:
-                print(f"  1. Items with status = '{self.config.target_status}'")
-            print()
+                _log_info(f" 1) Items with status = '{self.config.target_status}'")
             
             # Process all groups in parallel
             group_tasks = []
@@ -1371,12 +1433,11 @@ class MondayAttachmentJob:
                     total_failed += result.get("failed", 0)
                     total_no_pdf += result.get("no_pdf", 0)
             
-            print("==========================================")
-            print("Attachment download job completed")
-            print(f"   Groups processed: {groups_processed} / {len(self.config.groups)}")
-            print(f"   Success: {total_success}")
-            print(f"   Failed: {total_failed}")
-            print(f"   No PDF found: {total_no_pdf}")
+            _log_section("Attachment Download Summary")
+            _log_info(f"Groups processed: {groups_processed} / {len(self.config.groups)}")
+            _log_info(f"Success: {total_success}")
+            _log_info(f"Failed: {total_failed}")
+            _log_info(f"No PDF found: {total_no_pdf}")
             
             return {
                 "result": {
@@ -1396,15 +1457,14 @@ class MondayAttachmentJob:
     
     async def _process_group(self, board_id: int, group_title: str, status_col_id: str) -> dict:
         """Process a single group with true streaming: fetch and download in parallel"""
-        print("==========================================")
-        print(f"Processing Group: {group_title}")
+        _log_section(f"Processing Group: {group_title}")
         
         download_folder = self.config.group_folder_map.get(group_title)
         if not download_folder:
-            print(f"WARNING: No folder mapping found for group: {group_title}")
+            _log_warn(f"No folder mapping found for group: {group_title}")
             return {"processed": False, "success": 0, "failed": 0, "no_pdf": 0}
         
-        print(f"Download Folder: {download_folder}")
+        _log_info(f"Download folder: {download_folder}")
         
         success = 0
         failed = 0
@@ -1416,21 +1476,21 @@ class MondayAttachmentJob:
             # TRUE STREAMING: Start downloads immediately as items are found
             # Downloads run in background while fetching continues
             def on_batch_found(batch_item_ids):
-                print(f"Starting download for {len(batch_item_ids)} item(s)...")
+                _log_info(f"Queued {len(batch_item_ids)} item(s) for download.")
                 for item_id in batch_item_ids:
                     # Normalize item_id to int for consistent comparison
                     item_id_int = int(item_id) if item_id else None
                     if not item_id_int:
-                        print(f"  WARNING: Skipping invalid item ID: {item_id}")
+                        _log_warn(f"Skipping invalid item ID: {item_id}")
                         continue
                     
                     # Skip if already being processed (duplicate in batch)
                     if item_id_int in processed_item_ids:
-                        print(f"  SKIPPING duplicate item ID {item_id_int} (already queued for processing)")
+                        _log_warn(f"Skipping duplicate item ID {item_id_int} (already queued).")
                         continue
                     
                     processed_item_ids.add(item_id_int)
-                    print(f"  Processing item ID: {item_id_int}")
+                    _log_info(f"Processing item ID: {item_id_int}")
                     # Create task immediately - runs in background while fetching continues
                     task = asyncio.create_task(
                         self._process_item(board_id, item_id_int, download_folder, group_title)
@@ -1461,14 +1521,13 @@ class MondayAttachmentJob:
                     else:
                         failed += 1
             else:
-                print(f"INFO: No items found in group: {group_title}")
+                _log_info(f"No matching items found in group: {group_title}")
         
         except Exception as e:
-            print(f"ERROR: Failed to process group {group_title}: {e}")
+            _log_error(f"Failed to process group {group_title}: {e}")
             return {"processed": True, "success": 0, "failed": 1, "no_pdf": 0}
         
-        print(f"Group summary: {success} succeeded, {failed} failed, {no_pdf} with no PDF")
-        print()
+        _log_info(f"Group summary -> success: {success}, failed: {failed}, no_pdf: {no_pdf}")
         
         return {"processed": True, "success": success, "failed": failed, "no_pdf": no_pdf}
     
@@ -1480,17 +1539,22 @@ class MondayAttachmentJob:
             )
             
             if not has_pdf:
-                print(f"  WARNING: No PDF found for item {item_id} - updating status to '{self.config.error_status}'")
+                _log_warn(
+                    f"No PDF found for item {item_id}; updating status to '{self.config.error_status}'."
+                )
                 await self.item_service.update_status(item_id, self.config.error_status, board_id)
                 return "no_pdf"
             
             await self.item_service.update_status(item_id, self.config.new_status, board_id)
-            print(f"  Successfully processed item {item_id} ({pdf_count} PDF{'s' if pdf_count != 1 else ''})")
+            _log_info(
+                f"Processed item {item_id} successfully "
+                f"({pdf_count} PDF{'s' if pdf_count != 1 else ''})."
+            )
             
             return "success"
         
         except Exception as e:
-            print(f"  ERROR: Failed to process item {item_id}: {e}")
+            _log_error(f"Failed to process item {item_id}: {e}")
             return "failed"
     
     async def _resolve_board_id(self) -> int:
@@ -1505,7 +1569,7 @@ class MondayAttachmentJob:
         response = await self.http.post(payload)
         
         if "errors" in response:
-            print(f"WARNING: Workspace query had errors (this is okay, using fallback): {response['errors']}")
+            _log_warn(f"Workspace query failed, using board fallback: {response['errors']}")
             return await self._resolve_board_id_simple()
         
         workspaces = response.get("data", {}).get("workspaces", [])
@@ -1514,7 +1578,7 @@ class MondayAttachmentJob:
             workspace_name = workspace.get("name", "")
             if self.config.workspace_name == workspace_name:
                 workspace_id = workspace.get("id")
-                print(f"Found workspace '{workspace_name}' (ID: {workspace_id})")
+                _log_info(f"Matched workspace '{workspace_name}' (ID: {workspace_id}).")
                 break
         
         return await self._resolve_board_id_simple()
@@ -1550,7 +1614,7 @@ class MondayAttachmentJob:
         response = await self.http.post(payload)
         
         if "errors" in response:
-            print(f"WARNING: Could not list groups: {response['errors']}")
+            _log_warn(f"Could not list groups: {response['errors']}")
             return
         
         boards = response.get("data", {}).get("boards", [])
@@ -1559,10 +1623,10 @@ class MondayAttachmentJob:
         
         groups = boards[0].get("groups", [])
         if groups:
-            print("Groups found in board:")
+            _log_info("Groups found in board:")
             for group in groups:
                 group_title = group.get("title", "")
-                print(f"   - {group_title}")
+                _log_info(f" - {group_title}")
 
 
 # ============================================================================
@@ -2114,5 +2178,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_with_execution_log(main)
 
